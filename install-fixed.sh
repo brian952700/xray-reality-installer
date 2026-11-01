@@ -8,6 +8,29 @@ fail() { printf '%s\n' "错误：$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || fail '请使用 root 执行。'
 [ -r /etc/os-release ] || fail '无法识别系统。'
 . /etc/os-release
+# 从终端读取，避免 curl | sh 时把脚本内容当作输入。
+PORT=
+if [ -r /dev/tty ] && [ -w /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
+  while :; do
+    printf '请输入监听端口 [10000–65535，必填]：' > /dev/tty
+    if ! IFS= read -r INPUT_PORT < /dev/tty; then
+      fail '无法读取端口，请在交互式终端中重新执行。'
+    fi
+    case "$INPUT_PORT" in
+      *[!0-9]*|'') printf '%s\n' '端口必须是 10000–65535 的整数，不能为空。' > /dev/tty; continue ;;
+    esac
+    # 去除前导零，避免 JSON 数字不合法或被解释为八进制。
+    INPUT_PORT=$(printf '%s' "$INPUT_PORT" | sed 's/^0*//')
+    if [ -n "$INPUT_PORT" ] && [ "${#INPUT_PORT}" -le 5 ] && [ "$INPUT_PORT" -ge 10000 ] && [ "$INPUT_PORT" -le 65535 ]; then
+      PORT=$INPUT_PORT
+      break
+    fi
+    printf '%s\n' '端口必须在 10000–65535 之间。' > /dev/tty
+  done
+else
+  fail '未检测到交互式终端，必须在终端中输入端口后才能安装。'
+fi
+
 printf '%s\n' '[1/6] 检测系统并安装依赖...'
 case "$ID" in
   alpine)
@@ -27,29 +50,6 @@ case "$ID" in
   *) fail "暂不支持此系统：$ID" ;;
 esac
 DOMAIN="www.apple.com"
-# 从终端读取，避免 curl | sh 时把脚本内容当作输入。
-PORT=38503
-if [ -r /dev/tty ] && [ -w /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
-  while :; do
-    printf '请输入监听端口 [默认 38503]：' > /dev/tty
-    if ! IFS= read -r INPUT_PORT < /dev/tty; then
-      fail '无法读取端口，请在交互式终端中重新执行。'
-    fi
-    INPUT_PORT=${INPUT_PORT:-38503}
-    case "$INPUT_PORT" in
-      *[!0-9]*|'') printf '%s\n' '端口必须是 1–65535 的整数。' > /dev/tty; continue ;;
-    esac
-    # 去除前导零，避免 JSON 数字不合法或被解释为八进制。
-    INPUT_PORT=$(printf '%s' "$INPUT_PORT" | sed 's/^0*//')
-    if [ -n "$INPUT_PORT" ] && [ "${#INPUT_PORT}" -le 5 ] && [ "$INPUT_PORT" -ge 1 ] && [ "$INPUT_PORT" -le 65535 ]; then
-      PORT=$INPUT_PORT
-      break
-    fi
-    printf '%s\n' '端口必须在 1–65535 之间。' > /dev/tty
-  done
-else
-  printf '%s\n' '未检测到交互式终端，使用默认端口 38503。'
-fi
 UUID="78c3760d-daa3-4027-a278-f5d8fe015554"
 PRIVATE_KEY="yDhLeC8fLfEX6mls4gEZPCMshJm9HboURhXTaZaxR1o"
 PUBLIC_KEY="B2h9Dp8m8-hwwyFnlXi0Pj2zwbtD6vRQGmBbyciM_TE"
