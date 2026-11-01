@@ -27,7 +27,29 @@ case "$ID" in
   *) fail "暂不支持此系统：$ID" ;;
 esac
 DOMAIN="www.apple.com"
-PORT="38503"
+# 从终端读取，避免 curl | sh 时把脚本内容当作输入。
+PORT=38503
+if [ -r /dev/tty ] && [ -w /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
+  while :; do
+    printf '请输入监听端口 [默认 38503]：' > /dev/tty
+    if ! IFS= read -r INPUT_PORT < /dev/tty; then
+      fail '无法读取端口，请在交互式终端中重新执行。'
+    fi
+    INPUT_PORT=${INPUT_PORT:-38503}
+    case "$INPUT_PORT" in
+      *[!0-9]*|'') printf '%s\n' '端口必须是 1–65535 的整数。' > /dev/tty; continue ;;
+    esac
+    # 去除前导零，避免 JSON 数字不合法或被解释为八进制。
+    INPUT_PORT=$(printf '%s' "$INPUT_PORT" | sed 's/^0*//')
+    if [ -n "$INPUT_PORT" ] && [ "${#INPUT_PORT}" -le 5 ] && [ "$INPUT_PORT" -ge 1 ] && [ "$INPUT_PORT" -le 65535 ]; then
+      PORT=$INPUT_PORT
+      break
+    fi
+    printf '%s\n' '端口必须在 1–65535 之间。' > /dev/tty
+  done
+else
+  printf '%s\n' '未检测到交互式终端，使用默认端口 38503。'
+fi
 UUID="78c3760d-daa3-4027-a278-f5d8fe015554"
 PRIVATE_KEY="yDhLeC8fLfEX6mls4gEZPCMshJm9HboURhXTaZaxR1o"
 PUBLIC_KEY="B2h9Dp8m8-hwwyFnlXi0Pj2zwbtD6vRQGmBbyciM_TE"
@@ -163,7 +185,7 @@ printf '\n%s\n' '安装完成，服务已启动并设置开机自启。' "目标
 if [ "$SERVER_IP" = YOUR_SERVER_IP ]; then
   printf '%s\n' '无法获取公网 IPv4，请将链接中的 YOUR_SERVER_IP 替换为实际地址。'
 fi
-printf '%s\n' '请在主机防火墙和云安全组放行 TCP 38503；本脚本不会修改防火墙。'
+printf '%s\n' "请在主机防火墙和云安全组放行 TCP ${PORT}；本脚本不会修改防火墙。"
 if [ "$SERVICE_MANAGER" = systemd ]; then
   printf '%s\n' '查看状态：systemctl status xray' '重启服务：systemctl restart xray' '停止服务：systemctl stop xray' '查看日志：journalctl -u xray -n 50 --no-pager'
 else
