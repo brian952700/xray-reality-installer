@@ -11,10 +11,24 @@
 
 ## 一键下载安装（无需 Token）
 
-在服务器 root 终端执行下面整条命令。会自动安装 curl 和 CA 证书，然后下载并运行安装脚本，无需 GitHub 登录或 Token。
+在服务器 root 终端执行：
 
 ```sh
-sh -c 'set -e; [ "$(id -u)" -eq 0 ] || { echo "请使用 root 执行"; exit 1; }; . /etc/os-release; case "$ID" in debian) apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates;; alpine) apk add --no-cache curl ca-certificates;; *) echo "不支持此系统"; exit 1;; esac; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fL --retry 3 --connect-timeout 15 --max-time 120 "https://raw.githubusercontent.com/brian952700/xray-reality-installer/main/install-fixed.sh" -o "$f"; sh "$f"'
+curl -fsSL https://raw.githubusercontent.com/brian952700/xray-reality-installer/main/install-fixed.sh | sh
+```
+
+如果提示 `curl: command not found`，请先自行安装 curl 和 CA 证书，再重新执行上面的命令。脚本下载后会自动安装其余所需依赖。
+
+Debian：
+
+```sh
+apt-get update && apt-get install -y curl ca-certificates
+```
+
+Alpine：
+
+```sh
+apk add --no-cache curl ca-certificates
 ```
 
 [直接下载脚本](https://raw.githubusercontent.com/brian952700/xray-reality-installer/main/install-fixed.sh)
