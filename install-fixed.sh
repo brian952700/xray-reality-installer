@@ -1,0 +1,171 @@
+#!/bin/sh
+# Alpine Linux (OpenRC) / Debian 12+ (systemd)
+# root 执行: sh install-fixed.sh
+# 内含固定私钥，请勿公开；所有机器共用凭据。
+set -eu
+umask 077
+fail() { printf '%s\n' "错误：$*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || fail '请使用 root 执行。'
+[ -r /etc/os-release ] || fail '无法识别系统。'
+. /etc/os-release
+printf '%s\n' '[1/6] 检测系统并安装依赖...'
+case "$ID" in
+  alpine)
+    [ -d /run/openrc ] && command -v rc-service >/dev/null 2>&1 || fail '需要运行 OpenRC 的 Alpine 主机。'
+    apk add --no-cache ca-certificates curl unzip gcompat
+    SERVICE_MANAGER=openrc
+    ;;
+  debian)
+    MAJOR=${VERSION_ID%%.*}
+    case "$MAJOR" in ''|*[!0-9]*) fail '无法识别 Debian 版本。';; esac
+    [ "$MAJOR" -ge 12 ] || fail '仅支持 Debian 12 及以上版本。'
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 || fail '需要运行 systemd 的 Debian 主机。'
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl unzip
+    SERVICE_MANAGER=systemd
+    ;;
+  *) fail "暂不支持此系统：$ID" ;;
+esac
+DOMAIN="www.apple.com"
+PORT="38503"
+UUID="78c3760d-daa3-4027-a278-f5d8fe015554"
+PRIVATE_KEY="yDhLeC8fLfEX6mls4gEZPCMshJm9HboURhXTaZaxR1o"
+PUBLIC_KEY="B2h9Dp8m8-hwwyFnlXi0Pj2zwbtD6vRQGmBbyciM_TE"
+SHORT_ID="5e10da8e6afc9978"
+
+
+printf '%s\n' '[2/6] 检测 CPU 架构...'
+case "$(uname -m)" in
+  x86_64|amd64) XRAY_ARCH=64 ;;
+  aarch64|arm64) XRAY_ARCH=arm64-v8a ;;
+  armv7*) XRAY_ARCH=arm32-v7a ;;
+  s390x) XRAY_ARCH=s390x ;;
+  *) fail "不支持的 CPU 架构：$(uname -m)" ;;
+esac
+printf '%s\n' '[3/6] 下载 Xray-core...'
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+trap 'exit 1' HUP INT TERM
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
+curl -fL --retry 3 --connect-timeout 15 --max-time 300 "$XRAY_URL" -o "$STAGE/xray.zip"
+unzip -q "$STAGE/xray.zip" -d "$STAGE"
+chmod 755 "$STAGE/xray"
+printf '%s\n' '[4/6] 写入并检查固定配置...'
+cat > "$STAGE/config.json" << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "${DOMAIN}:443",
+          "serverNames": [
+            "${DOMAIN}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "${SHORT_ID}"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
+    }
+  ]
+}
+EOF
+
+
+chmod 600 "$STAGE/config.json"
+"$STAGE/xray" run -test -c "$STAGE/config.json"
+mkdir -p /opt/xray
+# 检查通过后替换，避免直接覆盖运行中的二进制文件。
+cp "$STAGE/xray" /opt/xray/xray.new
+chmod 755 /opt/xray/xray.new
+mv -f /opt/xray/xray.new /opt/xray/xray
+cp "$STAGE/config.json" /opt/xray/config.json.new
+mv -f /opt/xray/config.json.new /opt/xray/config.json
+printf '%s\n' '[5/6] 配置服务并启用开机自启...'
+if [ "$SERVICE_MANAGER" = systemd ]; then
+  cat > /etc/systemd/system/xray.service << 'UNIT'
+[Unit]
+Description=Xray VLESS REALITY Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/opt/xray/xray run -c /opt/xray/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chmod 644 /etc/systemd/system/xray.service
+  systemctl daemon-reload
+  systemctl enable xray
+  systemctl restart xray
+  sleep 2
+  systemctl is-active --quiet xray || {
+    journalctl -u xray -n 30 --no-pager >&2
+    fail 'Xray 启动失败，请查看以上日志。'
+  }
+else
+  cat > /etc/init.d/xray << 'RC'
+#!/sbin/openrc-run
+name=xray
+description="Xray VLESS REALITY Service"
+supervisor=supervise-daemon
+command=/opt/xray/xray
+command_args="run -c /opt/xray/config.json"
+pidfile=/run/xray.pid
+depend() {
+    need net
+}
+RC
+  chmod 755 /etc/init.d/xray
+  rc-update add xray default
+  if rc-service xray status >/dev/null 2>&1; then
+    rc-service xray restart
+  else
+    rc-service xray start
+  fi
+  sleep 2
+  rc-service xray status || fail 'Xray 启动失败。'
+fi
+printf '%s\n' '[6/6] 获取公网 IPv4 并生成链接...'
+SERVER_IP=$(curl -fsS4 --connect-timeout 5 --max-time 10 https://api.ipify.org || curl -fsS4 --connect-timeout 5 --max-time 10 https://ifconfig.me/ip || true)
+if ! printf '%s\n' "$SERVER_IP" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || $i>255) exit 1}'; then
+  SERVER_IP=YOUR_SERVER_IP
+fi
+VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Xray-REALITY-${DOMAIN}"
+printf '\n%s\n' '安装完成，服务已启动并设置开机自启。' "目标域名：$DOMAIN" "监听端口：$PORT/TCP" '配置文件：/opt/xray/config.json' '客户端链接：' "$VLESS_LINK"
+if [ "$SERVER_IP" = YOUR_SERVER_IP ]; then
+  printf '%s\n' '无法获取公网 IPv4，请将链接中的 YOUR_SERVER_IP 替换为实际地址。'
+fi
+printf '%s\n' '请在主机防火墙和云安全组放行 TCP 38503；本脚本不会修改防火墙。'
+if [ "$SERVICE_MANAGER" = systemd ]; then
+  printf '%s\n' '查看状态：systemctl status xray' '重启服务：systemctl restart xray' '停止服务：systemctl stop xray' '查看日志：journalctl -u xray -n 50 --no-pager'
+else
+  printf '%s\n' '查看状态：rc-service xray status' '重启服务：rc-service xray restart' '停止服务：rc-service xray stop'
+fi
