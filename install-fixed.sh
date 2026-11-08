@@ -13,11 +13,10 @@ if [ -z "$NO_COLOR_VALUE" ] && [ "$TERM_VALUE" != dumb ] && (test -t 1 || test -
 fi
 section() { printf '\n%s── %s ──%s\n\n' "$C_BLUE" "$*" "$C_RESET"; }
 ok() { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-warn() { printf '\n  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 fail() { printf '\n  %s✗%s %s\n\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 run_quiet() {
   TASK_LABEL=$1; shift
-  printf '  %s…%s %s\n' "$C_BLUE" "$C_RESET" "$TASK_LABEL"
+  printf '  %s…%s 正在%s，请稍候\n' "$C_BLUE" "$C_RESET" "$TASK_LABEL"
   if "$@" </dev/null >"$STAGE/task.log" 2>&1; then
     ok "$TASK_LABEL"
   else
@@ -56,11 +55,11 @@ else
   fail '未检测到交互式终端，必须在终端中输入端口后才能安装。'
 fi
 
-ok "已选择端口 $PORT"
+printf '\n  %s✓%s 已选择端口 %s\n\n%s── [1/6] 检查运行环境 ──%s\n\n' \
+  "$C_GREEN" "$C_RESET" "$PORT" "$C_BLUE" "$C_RESET"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 trap 'exit 1' HUP INT TERM
-section '[1/6] 检查运行环境'
 case "$ID" in
   alpine)
     [ -d /run/openrc ] && command -v rc-service >/dev/null 2>&1 || fail '需要运行 OpenRC 的 Alpine 主机。'
@@ -99,7 +98,7 @@ case "$(uname -m)" in
 esac
 section '[3/6] 下载 Xray'
 XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
-run_quiet '下载 Xray，请稍候（最多重试 3 次）' curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "$XRAY_URL" -o "$STAGE/xray.zip"
+run_quiet '下载 Xray' curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "$XRAY_URL" -o "$STAGE/xray.zip"
 run_quiet '解压安装文件' unzip -q "$STAGE/xray.zip" -d "$STAGE"
 chmod 755 "$STAGE/xray"
 section '[4/6] 生成并验证配置'
@@ -207,29 +206,50 @@ RC
   rc-service xray status || fail 'Xray 启动失败。'
 fi
 ok '服务正在运行，已设置开机自启'
-section '[6/6] 获取服务器地址'
-printf '  正在查询公网 IPv4…\n'
+printf '\n%s── [6/6] 获取服务器地址 ──%s\n\n  正在查询公网 IPv4，请稍候…\n' "$C_BLUE" "$C_RESET"
 SERVER_IP=$(curl -fsS4 --connect-timeout 5 --max-time 10 https://api.ipify.org || curl -fsS4 --connect-timeout 5 --max-time 10 https://ifconfig.me/ip || true)
 if ! printf '%s\n' "$SERVER_IP" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || $i>255) exit 1}'; then
   SERVER_IP=YOUR_SERVER_IP
 fi
 VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Xray-REALITY-${DOMAIN}"
-section '安装完成'
-ok '服务正在运行'
-ok '已设置开机自启'
-printf '\n  服务器地址  %s\n  监听端口    %s / TCP\n  目标域名    %s\n  配置文件    /opt/xray/config.json\n' "$SERVER_IP" "$PORT" "$DOMAIN"
-section '客户端连接链接'
-printf '%s\n' "$VLESS_LINK"
-
+IP_NOTICE=
 if [ "$SERVER_IP" = YOUR_SERVER_IP ]; then
-  warn '无法获取公网 IPv4，请将链接中的 YOUR_SERVER_IP 替换为实际地址。'
-fi
-warn "请在主机防火墙和云安全组放行 TCP ${PORT}。"
-section '服务管理'
-if [ "$SERVICE_MANAGER" = systemd ]; then
-  printf '%s\n' '查看状态：systemctl status xray' '重启服务：systemctl restart xray' '停止服务：systemctl stop xray' '查看日志：journalctl -u xray -n 50 --no-pager'
-else
-  printf '%s\n' '查看状态：rc-service xray status' '重启服务：rc-service xray restart' '停止服务：rc-service xray stop'
+  IP_NOTICE='  无法获取公网 IPv4，请将链接中的 YOUR_SERVER_IP 替换为实际地址。
+'
 fi
 
-printf "\n"
+if [ "$SERVICE_MANAGER" = systemd ]; then
+  SERVICE_COMMANDS='  查看状态：systemctl status xray
+  重启服务：systemctl restart xray
+  停止服务：systemctl stop xray
+  查看日志：journalctl -u xray -n 50 --no-pager'
+else
+  SERVICE_COMMANDS='  查看状态：rc-service xray status
+  重启服务：rc-service xray restart
+  停止服务：rc-service xray stop'
+fi
+
+printf '
+%s── 安装完成 ──%s
+
+  %s✓%s 服务正在运行，已设置开机自启
+
+  服务器地址  %s
+  监听端口    %s / TCP
+  目标域名    %s
+  配置文件    /opt/xray/config.json
+
+%s── 客户端连接链接 ──%s
+
+%s
+
+%s%s  请在主机防火墙和云安全组放行 TCP %s。%s
+
+%s── 服务管理 ──%s
+
+%s
+
+' "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET" \
+  "$SERVER_IP" "$PORT" "$DOMAIN" "$C_BLUE" "$C_RESET" "$VLESS_LINK" \
+  "$C_YELLOW" "$IP_NOTICE" "$PORT" "$C_RESET" \
+  "$C_BLUE" "$C_RESET" "$SERVICE_COMMANDS"
