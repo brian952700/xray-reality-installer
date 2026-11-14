@@ -12,6 +12,8 @@ import sys
 import tempfile
 import time
 import uuid
+from ipaddress import IPv4Address
+from urllib.parse import quote, urlencode
 
 ROOT = Path("/opt/xray")
 CONFIG = ROOT / "config.json"
@@ -68,6 +70,8 @@ def manage(action, name=None, progress=lambda message: None, expected_id=None):
         clients = inbounds[0]["settings"]["clients"]
         if action == "list":
             return clients
+        if action == 'list-links':
+            return inbounds[0]
 
         matches = [client for client in clients if client.get("email") == name]
         if action == "remove":
@@ -114,6 +118,53 @@ def display_users(users):
         columns = len(name) + (5 if name == "（未命名）" else 0)
         print(f"{index:>3}  {name}{' ' * (width - columns)}  {client['id']}")
     print(f"\n共 {len(users)} 位用户。")
+
+
+def display_links(inbound):
+    clients = inbound["settings"]["clients"]
+    display_users(clients)
+    if not clients:
+        return
+    stream = inbound["streamSettings"]
+    reality = stream["realitySettings"]
+    key = subprocess.run(
+        [str(BINARY), "x25519", "-i", reality["privateKey"]],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+    )
+    public_key = re.search(
+        r"^(?:Password(?: \(PublicKey\))?|Public\s*Key):\s*([\w-]{43})\s*$",
+        key.stdout, re.MULTILINE | re.IGNORECASE,
+    )
+    if key.returncode or not public_key:
+        raise ValueError("无法获取 REALITY 公钥，请检查 Xray 版本及配置。")
+
+    server = "YOUR_SERVER_IP"
+    for endpoint in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsS4", "--connect-timeout", "2", "--max-time", "4", endpoint],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+            server = str(IPv4Address(result.stdout.strip()))
+            break
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    if server == "YOUR_SERVER_IP":
+        print(color("无法检测公网 IPv4，请将链接中的 YOUR_SERVER_IP 替换为节点地址。", "33"))
+
+    for client in clients:
+        name = client.get("email") or "未命名"
+        params = {
+            "encryption": "none", "security": "reality",
+            "sni": reality["serverNames"][0], "fp": "chrome",
+            "pbk": public_key[1], "sid": reality["shortIds"][0],
+            "type": stream.get("network", "tcp"),
+        }
+        if client.get("flow"):
+            params["flow"] = client["flow"]
+        print(color(f"\n{name}", "36"))
+        print(f"vless://{quote(client['id'], safe='')}@{server}:{inbound['port']}"
+              f"?{urlencode(params)}#{quote(name, safe='')}")
 
 
 def uninstall():
@@ -171,7 +222,7 @@ def menu():
                     return
                 continue
             if choice == "1":
-                display_users(manage("list"))
+                display_links(manage("list-links"))
                 continue
             if choice not in actions:
                 print(color("请输入 0–5。", "33"))
@@ -238,12 +289,11 @@ def main():
     elif not NAME.fullmatch(args.name or ""):
         parser.error(NAME_HINT)
     try:
-        result = manage(args.action, args.name)
         if args.action == "list":
-            for client in result:
-                print(f'{client.get("email") or "（未命名）"}\t{client["id"]}')
-        else:
-            print(result)
+            display_links(manage("list-links"))
+            return
+        result = manage(args.action, args.name)
+        print(result)
     except ERRORS as error:
         parser.exit(1, f"错误：{error}\n")
 
