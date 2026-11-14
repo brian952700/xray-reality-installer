@@ -120,9 +120,14 @@ def display_users(users):
     print(f"\n共 {len(users)} 位用户。")
 
 
-def display_links(inbound):
+def display_links(inbound, user_id=None):
     clients = inbound["settings"]["clients"]
-    display_users(clients)
+    if user_id is None:
+        display_users(clients)
+    else:
+        clients = [client for client in clients if client["id"] == user_id]
+        if not clients:
+            raise ValueError("该用户已不在当前配置中。")
     if not clients:
         return
     stream = inbound["streamSettings"]
@@ -165,6 +170,13 @@ def display_links(inbound):
         print(color(f"\n{name}", "36"))
         print(f"vless://{quote(client['id'], safe='')}@{server}:{inbound['port']}"
               f"?{urlencode(params)}#{quote(name, safe='')}")
+
+
+def display_added_link(user_id):
+    try:
+        display_links(manage("list-links"), user_id)
+    except ERRORS + (IndexError,) as error:
+        print(color(f"用户已添加，但未能生成链接：{error}", "33"), file=sys.stderr)
 
 
 def uninstall():
@@ -264,6 +276,8 @@ def menu():
                 user, user_id = result.split("\t", 1)
                 print(color(f"\n✓ 已保存用户 {user}", "32"))
                 print(f"UUID  {user_id}")
+                if choice == "2":
+                    display_added_link(user_id)
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -294,6 +308,8 @@ def main():
             return
         result = manage(args.action, args.name)
         print(result)
+        if args.action == "add":
+            display_added_link(result.split("\t", 1)[1])
     except ERRORS as error:
         parser.exit(1, f"错误：{error}\n")
 
