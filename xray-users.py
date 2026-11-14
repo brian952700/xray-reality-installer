@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -115,20 +116,65 @@ def display_users(users):
     print(f"\n共 {len(users)} 位用户。")
 
 
+def uninstall():
+    if Path("/run/openrc").is_dir():
+        service = Path("/etc/init.d/xray")
+        stop = ("rc-service", "xray", "stop")
+        disable = ("rc-update", "del", "xray", "default")
+    elif Path("/run/systemd/system").is_dir():
+        service = Path("/etc/systemd/system/xray.service")
+        stop = ("systemctl", "stop", "xray.service")
+        disable = ("systemctl", "disable", "xray.service")
+    else:
+        raise ValueError("未找到 OpenRC 或 systemd。")
+
+    if service.is_symlink() or not service.is_file():
+        raise ValueError(f"未找到安装器创建的服务文件：{service}")
+    if str(BINARY) not in service.read_text(encoding="utf-8"):
+        raise ValueError(f"服务文件未指向 {BINARY}，已取消卸载。")
+    if ROOT.is_symlink() or not ROOT.is_dir():
+        raise ValueError(f"安装目录异常：{ROOT}")
+
+    print(color("\n将停止 Xray、取消开机自启，并永久删除以下内容：", "33"))
+    print(f"  {service}\n  {ROOT}（含程序、配置和全部用户）\n")
+    if input("输入 UNINSTALL 确认，回车取消：").strip() != "UNINSTALL":
+        print("已取消卸载。")
+        return False
+
+    os.umask(0o077)
+    with (ROOT / ".users.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        print(color("正在停止服务并取消开机自启…", "36"), flush=True)
+        command(*stop)
+        if disable[0] == "systemctl" or Path("/etc/runlevels/default/xray").is_symlink():
+            command(*disable)
+        service.unlink()
+        if disable[0] == "systemctl":
+            command("systemctl", "daemon-reload")
+        shutil.rmtree(ROOT)
+
+    print(color("\n✓ Xray 已卸载。", "32"))
+    return True
+
+
 def menu():
     actions = {"2": "add", "3": "name-existing", "4": "remove"}
     while True:
         try:
             print(color("\n── Xray 用户管理 ──", "36"))
-            print("\n  1. 查看所有用户\n  2. 新增用户\n  3. 给原有用户命名\n  4. 删除用户\n  0. 退出\n")
-            choice = input("请选择 [0–4]：").strip()
+            print("\n  1. 查看所有用户\n  2. 新增用户\n  3. 给原有用户命名\n  4. 删除用户\n  5. 完整卸载 Xray\n  0. 退出\n")
+            choice = input("请选择 [0–5]：").strip()
             if choice == "0":
                 return
+            if choice == "5":
+                if uninstall():
+                    return
+                continue
             if choice == "1":
                 display_users(manage("list"))
                 continue
             if choice not in actions:
-                print(color("请输入 0–4。", "33"))
+                print(color("请输入 0–5。", "33"))
                 continue
 
             expected_id = None
