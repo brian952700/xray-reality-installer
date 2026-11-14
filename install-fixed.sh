@@ -197,6 +197,7 @@ depend() {
 RC
   chmod 755 /etc/init.d/xray
   run_quiet '启用开机自启' rc-update add xray default
+  run_quiet '刷新 OpenRC 依赖缓存' rc-update -u show default
   if rc-service xray status >/dev/null 2>&1; then
     run_quiet '重启 Xray' rc-service xray restart
   else
