@@ -65,7 +65,7 @@ case "$ID" in
     [ -d /run/openrc ] && command -v rc-service >/dev/null 2>&1 || fail '需要运行 OpenRC 的 Alpine 主机。'
     ok 'Alpine / OpenRC 环境检查通过'
     section '[2/6] 安装所需依赖'
-    run_quiet '安装系统依赖' apk add --no-cache ca-certificates curl unzip gcompat
+    run_quiet '安装系统依赖' apk add --no-cache ca-certificates curl unzip gcompat python3
     SERVICE_MANAGER=openrc
     ;;
   debian)
@@ -76,7 +76,7 @@ case "$ID" in
     ok 'Debian / systemd 环境检查通过'
     section '[2/6] 安装所需依赖'
     run_quiet '更新软件源索引' apt-get update
-    run_quiet '安装系统依赖' env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl unzip
+    run_quiet '安装系统依赖' env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl unzip python3
     SERVICE_MANAGER=systemd
     ;;
   *) fail "暂不支持此系统：$ID" ;;
@@ -101,6 +101,9 @@ XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-
 run_quiet '下载 Xray' curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "$XRAY_URL" -o "$STAGE/xray.zip"
 run_quiet '解压安装文件' unzip -q "$STAGE/xray.zip" -d "$STAGE"
 chmod 755 "$STAGE/xray"
+XY_URL="https://raw.githubusercontent.com/brian952700/xray-reality-installer/db5a1aca565244828733da36b5b52a1fba367a54/xray-users.py"
+run_quiet '下载用户管理脚本' curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 "$XY_URL" -o "$STAGE/xy"
+run_quiet '验证用户管理脚本' python3 "$STAGE/xy" --help
 section '[4/6] 生成并验证配置'
 cat > "$STAGE/config.json" << EOF
 {
@@ -147,6 +150,17 @@ EOF
 
 chmod 600 "$STAGE/config.json"
 run_quiet '验证 Xray 配置' "$STAGE/xray" run -test -c "$STAGE/config.json"
+install_xy() (
+  mkdir -p /usr/local/bin || exit 1
+  xy_tmp=$(mktemp /usr/local/bin/.xy.XXXXXX) || exit 1
+  trap 'rm -f "$xy_tmp"' EXIT
+  cp "$STAGE/xy" "$xy_tmp" &&
+    chmod 755 "$xy_tmp" &&
+    mv -f "$xy_tmp" /usr/local/bin/xy &&
+    /usr/local/bin/xy --help
+)
+run_quiet '安装用户管理命令 xy' install_xy
+
 mkdir -p /opt/xray
 # 检查通过后替换，避免直接覆盖运行中的二进制文件。
 cp "$STAGE/xray" /opt/xray/xray.new
@@ -239,6 +253,7 @@ printf '
   监听端口    %s / TCP
   目标域名    %s
   配置文件    /opt/xray/config.json
+  用户管理    xy（也可运行 /usr/local/bin/xy）
 
 %s── 客户端连接链接 ──%s
 
