@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+# Managed by brian952700/xray-reality-installer.
 """Manage named users in an installed Xray VLESS inbound."""
 import argparse
+from contextlib import contextmanager
 import fcntl
+from hashlib import sha256
+from ipaddress import IPv4Address, ip_address
 import json
 import os
 from pathlib import Path
@@ -12,55 +16,221 @@ import sys
 import tempfile
 import time
 import uuid
-from ipaddress import IPv4Address
 from urllib.parse import quote, urlencode
 
 ROOT = Path("/opt/xray")
 CONFIG = ROOT / "config.json"
 BINARY = ROOT / "xray"
+LOCK = Path("/opt/.xray-install.lock")
+UNINSTALL_PENDING = Path("/opt/.xray-uninstall-pending")
+INSTALL_TRANSACTION = Path("/opt/.xray-install-transaction")
+XY = Path("/usr/local/bin/xy")
+OWNER = "brian952700/xray-reality-installer"
+XY_HEADER = f"# Managed by {OWNER}.".encode()
+LEGACY_XY_SHA256 = "ab20385585725b092443549221e7105c30746876bff8ce0e610ebfdbf0e3f549"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+IP_CACHE_SECONDS = 600
+SERVICE_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 
 
-def command(*args):
-    subprocess.run(args, check=True, stdin=subprocess.DEVNULL)
+@contextmanager
+def operation_lock(shared=False, timeout=15):
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+    with os.fdopen(os.open(LOCK, flags, 0o600), "rb") as lock:
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock, mode | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("另一个 Xray 管理操作尚未完成，请稍后重试。") from None
+                time.sleep(min(0.2, remaining))
+        yield
 
 
-def save(config, original, progress):
+def service_manager():
     if Path("/run/openrc").is_dir():
+        return "openrc"
+    if Path("/run/systemd/system").is_dir():
+        return "systemd"
+    raise ValueError("未找到 OpenRC 或 systemd。")
+
+
+def command(*args, timeout=30, check=True, quiet=False):
+    return subprocess.run(
+        args, check=check, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL if quiet else None,
+        stderr=subprocess.DEVNULL if quiet else None,
+        timeout=timeout,
+    )
+
+
+def managed_pids(manager, timeout):
+    if manager == "systemd":
+        try:
+            result = subprocess.run(
+                ("systemctl", "show", "--property=MainPID", "--value", "xray.service"),
+                capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                check=True,
+            )
+            pid = result.stdout.strip()
+            return [pid] if pid.isdecimal() and pid != "0" else []
+        except subprocess.TimeoutExpired:
+            return []
+
+    try:
+        supervisor = Path("/run/xray.pid").read_text(encoding="ascii").strip()
+        if not supervisor.isdecimal():
+            return []
+        children = Path(f"/proc/{supervisor}/task/{supervisor}/children")
+        try:
+            return children.read_text(encoding="ascii").split()
+        except FileNotFoundError:
+            # Custom kernels may omit the optional /proc children file.
+            return openrc_children(supervisor)
+    except OSError:
+        return []
+
+
+def openrc_children(supervisor):
+    pids = []
+    for process in Path("/proc").iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            with (process / "status").open(encoding="utf-8", errors="replace") as status:
+                for line in status:
+                    if line.startswith("PPid:"):
+                        if line.split()[1] == supervisor:
+                            pids.append(process.name)
+                        break
+        except OSError:
+            continue
+    return pids
+
+
+def listener_pid(ports, pids):
+    """Return the PID of Xray if it owns a listening socket on each port."""
+    sockets = {}
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="ascii") as source:
+                next(source, None)
+                for line in source:
+                    fields = line.split()
+                    if len(fields) < 10 or fields[3] != "0A":
+                        continue
+                    port = int(fields[1].rsplit(":", 1)[1], 16)
+                    if port in ports:
+                        sockets[f"socket:[{fields[9]}]"] = port
+        except FileNotFoundError:
+            continue
+    if not ports.issubset(sockets.values()):
+        return None
+
+    executable = str(BINARY.resolve())
+    for pid in pids:
+        if not pid.isdecimal():
+            continue
+        process = Path("/proc") / pid
+        try:
+            if os.readlink(process / "exe") != executable:
+                continue
+            owned_ports = set()
+            for descriptor in (process / "fd").iterdir():
+                try:
+                    target = os.readlink(descriptor)
+                except OSError:
+                    continue
+                if target in sockets:
+                    owned_ports.add(sockets[target])
+        except OSError:
+            continue
+        if owned_ports == ports:
+            return process.name
+    return None
+
+
+def wait_for_listener(ports, timeout=12):
+    ports = {int(port) for port in ports}
+    if not ports:
+        raise ValueError("没有可检查的 Xray TCP 监听端口。")
+    manager = service_manager()
+    deadline = time.monotonic() + timeout
+    previous_pid = None
+    while (remaining := deadline - time.monotonic()) > 0:
+        pids = managed_pids(manager, min(2, remaining))
+        pid = listener_pid(ports, pids) if pids else None
+        if pid and pid == previous_pid:
+            return
+        previous_pid = pid
+        time.sleep(max(0, min(0.35, deadline - time.monotonic())))
+    port_list = ", ".join(str(port) for port in sorted(ports))
+    raise ValueError(f"Xray 未在规定时间内监听 TCP {port_list}。")
+
+
+def save(config, original, port, progress):
+    manager = service_manager()
+    if manager == "openrc":
         restart = ("rc-service", "xray", "restart")
         status = ("rc-service", "xray", "status")
-    elif Path("/run/systemd/system").is_dir():
+    else:
         restart = ("systemctl", "restart", "xray")
         status = ("systemctl", "is-active", "--quiet", "xray")
-    else:
-        raise ValueError("未找到 OpenRC 或 systemd。")
 
     with tempfile.TemporaryDirectory(prefix=".users-", dir=ROOT) as directory:
         candidate = Path(directory) / "config.json"
-        backup = Path(directory) / "original.json"
-        os.umask(0o077)
+        previous = Path(directory) / "config.previous.json"
         candidate.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n",
                              encoding="utf-8")
         progress("正在验证配置…")
-        command(str(BINARY), "run", "-test", "-c", str(candidate))
-        backup.write_bytes(original)
-        os.replace(candidate, CONFIG)
+        command(str(BINARY), "run", "-test", "-c", str(candidate), timeout=15)
+        state = command(*status, timeout=5, check=False, quiet=True).returncode
+        stopped_states = (3, 16, 32, 64) if manager == "openrc" else (3,)
+        if state != 0 and state not in stopped_states:
+            raise ValueError("无法确认 Xray 的运行状态，请检查服务后再试。")
+        previous.write_bytes(original)
+        os.replace(previous, ROOT / previous.name)
+        if state != 0:
+            os.replace(candidate, CONFIG)
+            return
+
         try:
-            progress("正在重启 Xray…")
+            os.replace(candidate, CONFIG)
+            progress("正在重启并检查 Xray 监听…")
             command(*restart)
-            time.sleep(2)
-            command(*status)
-        except (OSError, subprocess.CalledProcessError, KeyboardInterrupt):
-            os.replace(backup, CONFIG)
-            print("新配置启动失败，已恢复原配置。", flush=True)
-            command(*restart)
-            raise
+            wait_for_listener([port])
+        except SERVICE_ERRORS + (KeyboardInterrupt,) as original_error:
+            if candidate.exists():
+                raise
+            try:
+                previous.write_bytes(original)
+                os.replace(previous, CONFIG)
+                command(*restart)
+                wait_for_listener([port])
+            except SERVICE_ERRORS + (KeyboardInterrupt,) as rollback_error:
+                raise ValueError(
+                    f"应用配置失败（{original_error or '操作已中断'}）。"
+                    f"回滚检查也失败（{rollback_error or '操作已中断'}）。"
+                    f"上一份配置可在 {ROOT / previous.name} 找到。"
+                ) from None
+            raise ValueError(
+                f"应用配置失败（{original_error or '操作已中断'}）。已恢复原配置和监听。"
+            ) from None
 
 
 def manage(action, name=None, progress=lambda message: None, expected_id=None):
     os.umask(0o077)
-    with (ROOT / ".users.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    read_only = action in ("list", "list-links")
+    with operation_lock(shared=read_only):
+        if INSTALL_TRANSACTION.exists() or INSTALL_TRANSACTION.is_symlink():
+            raise ValueError("上次安装或升级尚未完成，请重新运行安装脚本以恢复。")
+        if UNINSTALL_PENDING.exists() or UNINSTALL_PENDING.is_symlink():
+            raise ValueError("卸载尚未完成，请先通过 xy 菜单继续卸载。")
         original = CONFIG.read_bytes()
         config = json.loads(original)
         inbounds = [item for item in config["inbounds"]
@@ -97,10 +267,10 @@ def manage(action, name=None, progress=lambda message: None, expected_id=None):
                           "flow": "xtls-rprx-vision"}
                 clients.append(client)
             result = f'{name}\t{client["id"]}'
-        save(config, original, progress)
+        save(config, original, inbounds[0]["port"], progress)
         return result
 
-ERRORS = (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError)
+ERRORS = SERVICE_ERRORS + (KeyError, TypeError, IndexError)
 NAME_HINT = "用户名须为 1–64 位字母、数字、点、下划线或连字符，首位为字母或数字。"
 
 
@@ -120,6 +290,76 @@ def display_users(users):
     print(f"\n共 {len(users)} 位用户。")
 
 
+def format_server_address(value):
+    try:
+        address = ip_address(value)
+        if address.version == 6:
+            if address.scope_id is not None:
+                raise ValueError("节点地址不能使用 IPv6 区域标识。")
+            return f"[{address}]"
+        return str(address)
+    except ValueError:
+        pass
+    ascii_name = value.encode("idna").decode("ascii")
+    labels = ascii_name.rstrip(".").split(".")
+    if (len(ascii_name) <= 253 and len(labels) >= 2
+            and not all(label.isdecimal() for label in labels)
+            and all(HOST_LABEL.fullmatch(label) for label in labels)):
+        return ascii_name.lower().rstrip(".")
+    raise ValueError("节点地址必须是域名、IPv4 或 IPv6 地址。")
+
+
+def server_address():
+    """Resolve the node address for a connection link, with a bounded fallback."""
+    try:
+        configured = (ROOT / "server-address").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError):
+        print("无法读取节点地址文件，尝试获取公网 IPv4。", file=sys.stderr)
+    else:
+        try:
+            return format_server_address(configured)
+        except ValueError:
+            print("节点地址文件内容无效，尝试获取公网 IPv4。", file=sys.stderr)
+    cache = ROOT / "server-ip.cache"
+    current_install = None
+    try:
+        current_install = ROOT.stat()
+        with cache.open(encoding="ascii") as source:
+            age = time.time() - os.fstat(source.fileno()).st_mtime
+            if 0 <= age < IP_CACHE_SECONDS:
+                return str(IPv4Address(source.read().strip()))
+    except (OSError, ValueError):
+        pass
+    deadline = time.monotonic() + 3
+    for endpoint in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            result = subprocess.run(
+                ["curl", "-fsS4", "--connect-timeout", "1", "--max-time",
+                 f"{min(1.4, remaining):.3f}", endpoint],
+                capture_output=True, text=True, check=True, timeout=min(1.5, remaining),
+            )
+            address = str(IPv4Address(result.stdout.strip()))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        try:
+            with operation_lock(timeout=0):
+                if current_install and os.path.samestat(current_install, ROOT.stat()):
+                    with tempfile.TemporaryDirectory(prefix=".address-", dir=ROOT) as directory:
+                        candidate = Path(directory) / cache.name
+                        candidate.write_text(address + "\n", encoding="ascii")
+                        candidate.chmod(0o600)
+                        os.replace(candidate, cache)
+        except (OSError, ValueError):
+            pass
+        return address
+    return "YOUR_SERVER_IP"
+
+
 def display_links(inbound, user_id=None):
     clients = inbound["settings"]["clients"]
     if user_id is None:
@@ -132,10 +372,13 @@ def display_links(inbound, user_id=None):
         return
     stream = inbound["streamSettings"]
     reality = stream["realitySettings"]
-    key = subprocess.run(
-        [str(BINARY), "x25519", "-i", reality["privateKey"]],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True,
-    )
+    try:
+        key = subprocess.run(
+            [str(BINARY), "x25519", "-i", reality["privateKey"]],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("Xray 公钥计算超时。") from None
     public_key = re.search(
         r"^(?:Password(?: \(PublicKey\))?|Public\s*Key):\s*([\w-]{43})\s*$",
         key.stdout, re.MULTILINE | re.IGNORECASE,
@@ -143,17 +386,7 @@ def display_links(inbound, user_id=None):
     if key.returncode or not public_key:
         raise ValueError("无法获取 REALITY 公钥，请检查 Xray 版本及配置。")
 
-    server = "YOUR_SERVER_IP"
-    for endpoint in ("https://api.ipify.org", "https://ifconfig.me/ip"):
-        try:
-            result = subprocess.run(
-                ["curl", "-fsS4", "--connect-timeout", "2", "--max-time", "4", endpoint],
-                capture_output=True, text=True, check=True, timeout=5,
-            )
-            server = str(IPv4Address(result.stdout.strip()))
-            break
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
+    server = server_address()
     if server == "YOUR_SERVER_IP":
         print(color("无法检测公网 IPv4，请将链接中的 YOUR_SERVER_IP 替换为节点地址。", "33"))
 
@@ -175,46 +408,79 @@ def display_links(inbound, user_id=None):
 def display_added_link(user_id):
     try:
         display_links(manage("list-links"), user_id)
-    except ERRORS + (IndexError,) as error:
+    except ERRORS as error:
         print(color(f"用户已添加，但未能生成链接：{error}", "33"), file=sys.stderr)
 
 
+def xy_is_owned():
+    if XY.is_symlink() or not XY.is_file():
+        return False
+    with XY.open("rb") as source:
+        first = source.readline(128).rstrip(b"\r\n")
+        second = source.readline(128).rstrip(b"\r\n")
+        if first == b"#!/usr/bin/env python3" and second == XY_HEADER:
+            return True
+        if os.fstat(source.fileno()).st_size != 12651:
+            return False
+        source.seek(0)
+        return sha256(source.read()).hexdigest() == LEGACY_XY_SHA256
+
+
 def uninstall():
-    if Path("/run/openrc").is_dir():
+    manager = service_manager()
+    if manager == "openrc":
         service = Path("/etc/init.d/xray")
         stop = ("rc-service", "xray", "stop")
         disable = ("rc-update", "del", "xray", "default")
-    elif Path("/run/systemd/system").is_dir():
+    else:
         service = Path("/etc/systemd/system/xray.service")
         stop = ("systemctl", "stop", "xray.service")
         disable = ("systemctl", "disable", "xray.service")
-    else:
-        raise ValueError("未找到 OpenRC 或 systemd。")
-
-    if service.is_symlink() or not service.is_file():
-        raise ValueError(f"未找到安装器创建的服务文件：{service}")
-    if str(BINARY) not in service.read_text(encoding="utf-8"):
-        raise ValueError(f"服务文件未指向 {BINARY}，已取消卸载。")
-    if ROOT.is_symlink() or not ROOT.is_dir():
-        raise ValueError(f"安装目录异常：{ROOT}")
 
     print(color("\n将停止 Xray、取消开机自启，并永久删除以下内容：", "33"))
-    print(f"  {service}\n  {ROOT}（含程序、配置和全部用户）\n")
+    print(f"  {service}\n  {ROOT}（含程序、配置和全部用户）\n  {XY}（若由本安装器创建）\n")
     if input("输入 UNINSTALL 确认，回车取消：").strip() != "UNINSTALL":
         print("已取消卸载。")
         return False
 
     os.umask(0o077)
-    with (ROOT / ".users.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        print(color("正在停止服务并取消开机自启…", "36"), flush=True)
-        command(*stop)
-        if disable[0] == "systemctl" or Path("/etc/runlevels/default/xray").is_symlink():
-            command(*disable)
-        service.unlink()
-        if disable[0] == "systemctl":
+    with operation_lock():
+        if INSTALL_TRANSACTION.exists() or INSTALL_TRANSACTION.is_symlink():
+            raise ValueError("上次安装或升级尚未完成，请重新运行安装脚本以恢复。")
+        if ROOT.is_symlink() or service.is_symlink() or UNINSTALL_PENDING.is_symlink():
+            raise ValueError("安装目录、服务文件或卸载记录异常，已取消卸载。")
+        pending = UNINSTALL_PENDING.is_file()
+        if pending and UNINSTALL_PENDING.read_text(encoding="utf-8").strip() != OWNER:
+            raise ValueError("卸载记录内容异常，已取消卸载。")
+        if (ROOT.exists() or not pending) and not ROOT.is_dir():
+            raise ValueError(f"安装目录异常：{ROOT}")
+        if service.is_file():
+            definition = service.read_text(encoding="utf-8").splitlines()
+            if (f"command={BINARY}" not in definition
+                    and not any(line.startswith(f"ExecStart={BINARY} run ") for line in definition)):
+                raise ValueError(f"服务文件未指向 {BINARY}，已取消卸载。")
+            print(color("正在停止服务并取消开机自启…", "36"), flush=True)
+            command(*stop)
+            if manager == "systemd" or Path("/etc/runlevels/default/xray").is_symlink():
+                command(*disable)
+            if not pending:
+                with tempfile.TemporaryDirectory(prefix=".uninstall-", dir=UNINSTALL_PENDING.parent) as directory:
+                    candidate = Path(directory) / UNINSTALL_PENDING.name
+                    candidate.write_text(OWNER + "\n", encoding="utf-8")
+                    os.replace(candidate, UNINSTALL_PENDING)
+            service.unlink()
+        elif service.exists() or not pending:
+            raise ValueError(f"未找到安装器创建的服务文件：{service}")
+
+        if manager == "systemd":
             command("systemctl", "daemon-reload")
-        shutil.rmtree(ROOT)
+        else:
+            command("rc-update", "-u", "show", "default")
+        if ROOT.exists():
+            shutil.rmtree(ROOT)
+        if xy_is_owned():
+            XY.unlink()
+        UNINSTALL_PENDING.unlink()
 
     print(color("\n✓ Xray 已卸载。", "32"))
     return True
@@ -287,11 +553,13 @@ def menu():
 
 def main():
     parser = argparse.ArgumentParser(description="管理 Xray VLESS 用户")
+    parser.add_argument("--version", action="version", version="xy 1.1")
     parser.add_argument("action", nargs="?", choices=("list", "add", "remove", "name-existing"))
     parser.add_argument("name", nargs="?")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("请用 root 执行。")
+    os.umask(0o077)
     if args.action is None:
         if not sys.stdin.isatty():
             parser.error("菜单需要交互终端。可指定 list、add、remove 或 name-existing。")
