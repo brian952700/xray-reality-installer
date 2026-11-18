@@ -584,8 +584,8 @@ main() {
   section '[3/5] 下载并校验文件'
   XRAY_VERSION=v26.11.9
   XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-$XRAY_ARCH.zip"
-  XY_URL='https://raw.githubusercontent.com/brian952700/xray-reality-installer/f1103b78cc2f36e3fbc6147a77fbf84551a428ef/xray-users.py'
-  XY_SHA256='d0abc2cbf116a4e6b3501416b38f02ff8a982f7171e6b2d7dd2e55b5e0b69056'
+  XY_URL='https://raw.githubusercontent.com/brian952700/xray-reality-installer/8e899714d33598bdb91f84f4cb15639e15ea9227/xray-users.py'
+  XY_SHA256='93b0165e2f8d3ed548d5dbc0efb7c722862be76a9aa930c50ecd7c01634e2e41'
   run_quiet "下载 Xray $XRAY_VERSION" curl -fsSL --retry 2 --retry-max-time 120 --connect-timeout 10 --max-time 90 "$XRAY_URL" -o "$STAGE/xray.zip"
   run_quiet '下载用户管理脚本' curl -fsSL --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 25 "$XY_URL" -o "$STAGE/xy"
   printf '%s  %s\n' "$XRAY_SHA256" "$STAGE/xray.zip" "$XY_SHA256" "$STAGE/xy" > "$STAGE/checksums"
