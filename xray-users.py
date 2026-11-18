@@ -722,11 +722,12 @@ def configure_egress():
                     and user.get("email") in rule.get("user", [])), "原配置")
         description = describe_egress(exits[tag]) if tag in exits else "原配置"
         print(f"  {index}. 当前出口  {description}")
-    selected = input("\n输入走新出口的用户编号，以空格或逗号分隔，回车取消：").strip()
-    if not selected:
+    if not users:
+        print("当前没有可配置出口的用户。")
         return
-    numbers = set(re.split(r"[\s,，]+", selected))
+    selected = input("\n输入走新出口的用户编号，以空格或逗号分隔；留空回车选择全部当前用户：").strip()
     choices = {str(index): user for index, user in enumerate(users, 1)}
+    numbers = set(re.split(r"[\s,，]+", selected)) if selected else set(choices)
     if not numbers.issubset(choices):
         raise ValueError("用户编号无效。")
     selected_users = [user for index, user in choices.items() if index in numbers]
@@ -735,8 +736,11 @@ def configure_egress():
         return
     outbound = parse_exit_link(link)
     print(f"\n  出口  {describe_egress(outbound)}")
+    if len(selected_users) == len(users):
+        print(f"  范围  全部当前用户（共 {len(users)} 人）")
     print("  用户  " + ", ".join(user.get("email") or "未命名（将自动命名）" for user in selected_users))
-    print("  未选中的用户保留现有规则。")
+    if len(selected_users) < len(users):
+        print("  未选中的用户保留现有规则。")
     if input("\n确认应用？输入 y 确认，回车取消：").strip().lower() != "y":
         print("已取消。")
         return
@@ -816,7 +820,7 @@ def menu():
 
 def main():
     parser = argparse.ArgumentParser(description="管理 Xray VLESS 用户")
-    parser.add_argument("--version", action="version", version="xy 1.2")
+    parser.add_argument("--version", action="version", version="xy 1.2.1")
     parser.add_argument("action", nargs="?", choices=("list", "add", "remove", "name-existing"))
     parser.add_argument("name", nargs="?")
     args = parser.parse_args()
