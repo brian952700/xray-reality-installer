@@ -2,6 +2,9 @@
 # Managed by brian952700/xray-reality-installer.
 """Manage named users in an installed Xray VLESS inbound."""
 import argparse
+import base64
+import binascii
+from copy import deepcopy
 from contextlib import contextmanager
 import fcntl
 from hashlib import sha256
@@ -16,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, unquote, parse_qsl
 
 ROOT = Path("/opt/xray")
 CONFIG = ROOT / "config.json"
@@ -223,9 +226,10 @@ def save(config, original, port, progress):
             ) from None
 
 
-def manage(action, name=None, progress=lambda message: None, expected_id=None):
+def manage(action, name=None, progress=lambda message: None, expected_id=None,
+           expected_config=None, selected_ids=None, outbound=None):
     os.umask(0o077)
-    read_only = action in ("list", "list-links")
+    read_only = action in ("list", "list-links", "snapshot")
     with operation_lock(shared=read_only):
         if INSTALL_TRANSACTION.exists() or INSTALL_TRANSACTION.is_symlink():
             raise ValueError("上次安装或升级尚未完成，请重新运行安装脚本以恢复。")
@@ -238,6 +242,14 @@ def manage(action, name=None, progress=lambda message: None, expected_id=None):
         if len(inbounds) != 1:
             raise ValueError("配置必须恰好包含一个 VLESS 入站。")
         clients = inbounds[0]["settings"]["clients"]
+        if action == "snapshot":
+            return config, sha256(original).hexdigest()
+        if action == "egress":
+            if sha256(original).hexdigest() != expected_config:
+                raise ValueError("配置已被其他操作修改，请重新选择用户。")
+            apply_egress(config, inbounds[0], selected_ids, outbound)
+            save(config, original, inbounds[0]["port"], progress)
+            return "出口配置已保存。"
         if action == "list":
             return clients
         if action == 'list-links':
@@ -252,6 +264,7 @@ def manage(action, name=None, progress=lambda message: None, expected_id=None):
             if len(clients) == 1:
                 raise ValueError("至少保留一名用户。")
             clients.remove(matches[0])
+            remove_egress_users(config, {name})
             result = f"已删除 {name}。"
         else:
             if matches:
@@ -486,24 +499,274 @@ def uninstall():
     return True
 
 
+EGRESS_PREFIX = "xy-egress-"
+
+
+def decode_base64(value):
+    try:
+        return base64.b64decode(value + "=" * (-len(value) % 4),
+                                altchars=b"-_", validate=True).decode("utf-8")
+    except (ValueError, UnicodeError, binascii.Error):
+        raise ValueError("链接的 Base64 内容无效。") from None
+
+
+def link_endpoint(parsed):
+    try:
+        port = parsed.port
+        host = parsed.hostname
+        if not host or port is None or not 1 <= port <= 65535:
+            raise ValueError()
+        host = format_server_address(host).strip("[]")
+        return host, port
+    except (ValueError, UnicodeError):
+        raise ValueError("出口链接需要有效的服务器地址和 1–65535 端口。") from None
+
+
+def parse_exit_link(link):
+    if len(link) > 32768 or any(char.isspace() for char in link):
+        raise ValueError("请粘贴一条完整链接，不能包含空白字符。")
+    if link.startswith("ss://"):
+        # SIP002 encodes only userinfo; older links encode the entire authority.
+        body = link[5:].split("#", 1)[0]
+        if "@" not in body.split("?", 1)[0]:
+            if "?" in body:
+                raise ValueError("旧式 SS 链接不能包含额外参数。")
+            body = decode_base64(body)
+        parsed = urlsplit("ss://" + body)
+        if parsed.query or parsed.path not in ("", "/"):
+            raise ValueError("暂不支持带插件或其他参数的 SS 链接。")
+        host, port = link_endpoint(parsed)
+        authority = parsed.netloc.rsplit("@", 1)
+        if len(authority) != 2:
+            raise ValueError("SS 链接缺少认证信息。")
+        auth = unquote(authority[0])
+        if ":" not in auth:
+            auth = decode_base64(auth)
+        method, separator, password = auth.partition(":")
+        if not separator or not password:
+            raise ValueError("SS 链接缺少加密方式或密码。")
+        methods = {"aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+                   "chacha20-poly1305", "xchacha20-ietf-poly1305",
+                   "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+                   "2022-blake3-chacha20-poly1305"}
+        if method not in methods:
+            raise ValueError("此 SS 加密方式暂不支持。")
+        return {"protocol": "shadowsocks", "settings": {"servers": [
+            {"address": host, "port": port, "method": method, "password": password}]}}
+
+    if not link.startswith("vless://"):
+        raise ValueError("仅支持 vless:// 或 ss:// 出口链接。")
+    parsed = urlsplit(link)
+    host, port = link_endpoint(parsed)
+    if parsed.password is not None or parsed.path not in ("", "/"):
+        raise ValueError("VLESS 链接格式无效。")
+    try:
+        user_id = str(uuid.UUID(unquote(parsed.username or "")))
+    except ValueError:
+        raise ValueError("VLESS 链接需要有效的 UUID。") from None
+    query = {}
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key in query:
+            raise ValueError(f"链接参数重复：{key}")
+        query[key] = value
+    allowed = {"encryption", "flow", "security", "type", "sni", "serverName",
+               "fp", "pbk", "sid", "spx", "alpn", "path", "host", "serviceName",
+               "mode", "authority", "headerType", "packetEncoding", "extra"}
+    unknown = set(query) - allowed
+    if unknown:
+        raise ValueError("暂不支持以下链接参数：" + ", ".join(sorted(unknown)))
+    network = query.get("type", "tcp") or "tcp"
+    network = {"raw": "tcp", "splithttp": "xhttp"}.get(network, network)
+    if network not in {"tcp", "ws", "grpc", "xhttp", "httpupgrade"}:
+        raise ValueError("暂不支持该 VLESS 传输方式。")
+    security = query.get("security", "none") or "none"
+    if security not in {"none", "tls", "reality"}:
+        raise ValueError("暂不支持该 VLESS 安全协议。")
+    if query.get("headerType", "none") != "none":
+        raise ValueError("暂不支持 TCP 头部伪装。")
+    transport_parameters = {
+        "path": {"ws", "xhttp", "httpupgrade"},
+        "host": {"ws", "xhttp", "httpupgrade"},
+        "serviceName": {"grpc"}, "authority": {"grpc"},
+        "mode": {"grpc", "xhttp"}, "extra": {"xhttp"},
+    }
+    for key, networks in transport_parameters.items():
+        if query.get(key) and network not in networks:
+            raise ValueError(f"链接参数 {key} 不适用于 {network} 传输。")
+    if security != "reality" and any(query.get(key) for key in ("pbk", "sid", "spx")):
+        raise ValueError("链接含 REALITY 参数，请检查 security。")
+    user = {"id": user_id, "encryption": query.get("encryption") or "none"}
+    if query.get("flow"):
+        if query["flow"] != "xtls-rprx-vision" or network != "tcp" or security == "none":
+            raise ValueError("Vision flow 需要 TCP 配合 TLS 或 REALITY。")
+        user["flow"] = query["flow"]
+    settings = {"vnext": [{"address": host, "port": port, "users": [user]}]}
+    if query.get("packetEncoding"):
+        if query["packetEncoding"] not in {"xudp", "packet"}:
+            raise ValueError("不支持该 packetEncoding。")
+        settings["packetEncoding"] = query["packetEncoding"]
+    stream = {"network": network, "security": security}
+    sni = query.get("sni") or query.get("serverName") or host
+    if security == "tls":
+        tls = {"serverName": sni, "fingerprint": query.get("fp") or "chrome"}
+        if query.get("alpn"):
+            tls["alpn"] = query["alpn"].split(",")
+        stream["tlsSettings"] = tls
+    if security == "reality":
+        if network not in {"tcp", "grpc", "xhttp"} or not query.get("pbk"):
+            raise ValueError("REALITY 需要公钥及受支持的传输方式。")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", query["pbk"]):
+            raise ValueError("REALITY 公钥格式无效。")
+        sid = query.get("sid", "")
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{2}){0,8}", sid):
+            raise ValueError("REALITY shortId 格式无效。")
+        stream["realitySettings"] = {
+            "serverName": sni, "fingerprint": query.get("fp") or "chrome",
+            "publicKey": query["pbk"], "shortId": sid, "spiderX": query.get("spx", "")}
+    if network == "ws":
+        stream["wsSettings"] = {"path": query.get("path") or "/"}
+        if query.get("host"):
+            stream["wsSettings"]["headers"] = {"Host": query["host"]}
+    if network == "httpupgrade":
+        stream["httpupgradeSettings"] = {
+            "path": query.get("path") or "/", "host": query.get("host", "")}
+    if network == "grpc":
+        mode = query.get("mode", "gun")
+        if mode not in {"gun", "multi"}:
+            raise ValueError("gRPC mode 需要为 gun 或 multi。")
+        stream["grpcSettings"] = {"serviceName": query.get("serviceName", ""),
+                                  "multiMode": mode == "multi"}
+        if query.get("authority"):
+            stream["grpcSettings"]["authority"] = query["authority"]
+    if network == "xhttp":
+        mode = query.get("mode") or "auto"
+        if mode not in {"auto", "packet-up", "stream-up", "stream-one"}:
+            raise ValueError("XHTTP mode 无效。")
+        extra = json.loads(query.get("extra") or "{}")
+        if not isinstance(extra, dict):
+            raise ValueError("XHTTP extra 必须为 JSON 对象。")
+        stream["xhttpSettings"] = {"path": query.get("path") or "/",
+                                   "host": query.get("host", ""), "mode": mode,
+                                   "extra": extra}
+    return {"protocol": "vless", "settings": settings, "streamSettings": stream}
+
+
+def remove_egress_users(config, names):
+    rules = config.get("routing", {}).get("rules", [])
+    retained = []
+    for rule in rules:
+        if rule.get("outboundTag", "").startswith(EGRESS_PREFIX):
+            rule["user"] = [name for name in rule.get("user", []) if name not in names]
+            if not rule["user"]:
+                continue
+        retained.append(rule)
+    if "routing" in config:
+        config["routing"]["rules"] = retained
+    referenced = {rule.get("outboundTag") for rule in retained}
+    config["outbounds"] = [item for item in config.get("outbounds", [])
+                           if not item.get("tag", "").startswith(EGRESS_PREFIX)
+                           or item["tag"] in referenced]
+
+
+def apply_egress(config, inbound, selected_ids, outbound):
+    if not config.get("outbounds"):
+        raise ValueError("原配置缺少默认出口，请先检查 outbounds。")
+    clients = inbound["settings"]["clients"]
+    selected = [client for client in clients if client["id"] in selected_ids]
+    if not selected or len(selected) != len(set(selected_ids)):
+        raise ValueError("选中的用户已变更，请重新选择。")
+    all_names = [client.get("email") for entry in config["inbounds"]
+                 for client in entry.get("settings", {}).get("clients", [])
+                 if client.get("email")]
+    names = []
+    for client in selected:
+        name = client.get("email")
+        if name and all_names.count(name) != 1:
+            raise ValueError("用户名重复，请先调整配置中的 email。")
+        if not name:
+            name = "user-" + str(uuid.uuid4())
+            client["email"] = name
+        names.append(name)
+    remove_egress_users(config, set(names))
+    if not inbound.get("tag"):
+        inbound["tag"] = "xy-inbound-" + uuid.uuid4().hex
+    if sum(item.get("tag") == inbound["tag"] for item in config["inbounds"]) != 1:
+        raise ValueError("入站 tag 重复，无法按用户配置出口。")
+    exit_config = deepcopy(outbound)
+    exit_config["tag"] = EGRESS_PREFIX + uuid.uuid4().hex
+    config.setdefault("outbounds", []).append(exit_config)
+    rule = {"type": "field", "inboundTag": [inbound["tag"]],
+            "user": names, "outboundTag": exit_config["tag"]}
+    config.setdefault("routing", {}).setdefault("rules", []).insert(0, rule)
+
+
+def describe_egress(outbound):
+    endpoint = (outbound["settings"]["vnext"][0] if outbound["protocol"] == "vless"
+                else outbound["settings"]["servers"][0])
+    address = endpoint["address"]
+    if ":" in address:
+        address = f"[{address}]"
+    return f"{outbound['protocol']} / {address}:{endpoint['port']}"
+
+
+def configure_egress():
+    config, revision = manage("snapshot")
+    inbound = next(item for item in config["inbounds"] if item.get("protocol") == "vless")
+    users = inbound["settings"]["clients"]
+    print(color("\n── 为用户配置出口 ──\n", "36"))
+    display_users(users)
+    exits = {item.get("tag"): item for item in config.get("outbounds", [])}
+    for index, user in enumerate(users, 1):
+        tag = next((rule["outboundTag"] for rule in config.get("routing", {}).get("rules", [])
+                    if rule.get("outboundTag", "").startswith(EGRESS_PREFIX)
+                    and user.get("email") in rule.get("user", [])), "原配置")
+        description = describe_egress(exits[tag]) if tag in exits else "原配置"
+        print(f"  {index}. 当前出口  {description}")
+    selected = input("\n输入走新出口的用户编号，以空格或逗号分隔，回车取消：").strip()
+    if not selected:
+        return
+    numbers = set(re.split(r"[\s,，]+", selected))
+    choices = {str(index): user for index, user in enumerate(users, 1)}
+    if not numbers.issubset(choices):
+        raise ValueError("用户编号无效。")
+    selected_users = [user for index, user in choices.items() if index in numbers]
+    link = input("粘贴 vless:// 或 ss:// 出口链接，回车取消：").strip()
+    if not link:
+        return
+    outbound = parse_exit_link(link)
+    print(f"\n  出口  {describe_egress(outbound)}")
+    print("  用户  " + ", ".join(user.get("email") or "未命名（将自动命名）" for user in selected_users))
+    print("  未选中的用户保留现有规则。")
+    if input("\n确认应用？输入 y 确认，回车取消：").strip().lower() != "y":
+        print("已取消。")
+        return
+    message = manage("egress", expected_config=revision,
+                     selected_ids=[user["id"] for user in selected_users], outbound=outbound,
+                     progress=lambda text: print(color(text, "36"), flush=True))
+    print(color("\n✓ " + message, "32"))
+
+
 def menu():
     actions = {"2": "add", "3": "name-existing", "4": "remove"}
     while True:
         try:
             print(color("\n── Xray 用户管理 ──", "36"))
-            print("\n  1. 查看所有用户\n  2. 新增用户\n  3. 给原有用户命名\n  4. 删除用户\n  5. 完整卸载 Xray\n  0. 退出\n")
-            choice = input("请选择 [0–5]：").strip()
+            print("\n  1. 查看所有用户\n  2. 新增用户\n  3. 给原有用户命名\n  4. 删除用户\n  5. 配置用户出口\n  6. 完整卸载 Xray\n  0. 退出\n")
+            choice = input("请选择 [0–6]：").strip()
             if choice == "0":
                 return
-            if choice == "5":
+            if choice == "6":
                 if uninstall():
                     return
+                continue
+            if choice == "5":
+                configure_egress()
                 continue
             if choice == "1":
                 display_links(manage("list-links"))
                 continue
             if choice not in actions:
-                print(color("请输入 0–5。", "33"))
+                print(color("请输入 0–6。", "33"))
                 continue
 
             expected_id = None
@@ -553,7 +816,7 @@ def menu():
 
 def main():
     parser = argparse.ArgumentParser(description="管理 Xray VLESS 用户")
-    parser.add_argument("--version", action="version", version="xy 1.1")
+    parser.add_argument("--version", action="version", version="xy 1.2")
     parser.add_argument("action", nargs="?", choices=("list", "add", "remove", "name-existing"))
     parser.add_argument("name", nargs="?")
     args = parser.parse_args()
