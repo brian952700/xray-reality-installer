@@ -71,6 +71,7 @@ make_initial_config() {
         "clients": [
           {
             "id": "${UUID}",
+            "email": "admin",
             "flow": "xtls-rprx-vision"
           }
         ],
