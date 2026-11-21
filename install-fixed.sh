@@ -17,12 +17,48 @@ fail() { printf '\n  %s✗%s %s\n\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 run_quiet() {
   TASK_LABEL=$1; shift
   printf '  %s…%s 正在%s，请稍候\n' "$C_BLUE" "$C_RESET" "$TASK_LABEL"
-  if "$@" </dev/null >"$STAGE/task.log" 2>&1; then
+  TASK_TIMER=
+  if [ -t 1 ] && [ "$TERM_VALUE" != dumb ]; then
+    (
+      elapsed=0
+      while sleep 1; do
+        elapsed=$((elapsed + 1))
+        printf '\r  正在%s，已等待 %s 秒' "$TASK_LABEL" "$elapsed"
+      done
+    ) &
+    TASK_TIMER=$!
+  fi
+  task_status=0
+  "$@" </dev/null >"$STAGE/task.log" 2>&1 || task_status=$?
+  stop_task_timer
+  if [ "$task_status" -eq 0 ]; then
     ok "$TASK_LABEL"
   else
     printf '\n%s执行失败：%s%s\n' "$C_RED" "$TASK_LABEL" "$C_RESET" >&2
     cat "$STAGE/task.log" >&2
     fail '安装未完成，请根据以上日志排查后重试。'
+  fi
+}
+
+stop_task_timer() {
+  if [ -n "${TASK_TIMER-}" ]; then
+    kill "$TASK_TIMER" 2>/dev/null || :
+    wait "$TASK_TIMER" 2>/dev/null || :
+    TASK_TIMER=
+    printf '\r\033[K'
+  fi
+}
+
+download_xray() {
+  if [ -t 2 ] && [ "$TERM_VALUE" != dumb ]; then
+    printf '  正在下载 Xray %s（临时网络错误会自动重试）\n' "$XRAY_VERSION" >&2
+    curl -fL --progress-bar --retry 2 --retry-max-time 120 --connect-timeout 10 \
+      --max-time 90 "$XRAY_URL" -o "$STAGE/xray.zip" ||
+      fail '下载 Xray 失败，请检查网络后重试。'
+    ok "下载 Xray $XRAY_VERSION"
+  else
+    run_quiet "下载 Xray $XRAY_VERSION" curl -fsSL --retry 2 --retry-max-time 120 \
+      --connect-timeout 10 --max-time 90 "$XRAY_URL" -o "$STAGE/xray.zip"
   fi
 }
 
@@ -208,11 +244,15 @@ def locked(path):
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "r+b") as lock:
         deadline = time.monotonic() + lock_wait
+        waiting = False
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                if not waiting:
+                    print("  正在等待其他 Xray 管理操作完成…", flush=True)
+                    waiting = True
                 if time.monotonic() >= deadline:
                     raise RuntimeError("另一项 Xray 管理操作正在执行，请稍后重试。") from None
                 time.sleep(0.1)
@@ -434,6 +474,7 @@ def update():
     if not candidate.exists():
         raise RuntimeError("没有可用的配置，请重新运行安装并输入端口。")
     port = inbound_port(candidate)
+    print("  正在验证 Xray 配置…", flush=True)
     command(str(stage / "xray"), "run", "-test", "-c", str(candidate), timeout=20)
 
     staged_marker = stage / "owned"
@@ -475,8 +516,12 @@ def update():
                 reload_service()
             if service_changed:
                 try:
+                    operation = "重启" if was_active else "启动"
+                    print(f"  正在{operation} Xray 服务…", flush=True)
                     service_action("restart" if was_active else "start")
+                    print(f"  正在检查 TCP {port} 监听…", flush=True)
                     wait_for_service(port)
+                    print("  ✓ Xray 监听端口已就绪。", flush=True)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                     if systemd:
                         try:
@@ -569,7 +614,7 @@ main() {
   ok "${PRETTY_NAME:-$ID} / $(uname -m)"
   mkdir -p /opt
   STAGE=$(mktemp -d /opt/.xray-install-stage.XXXXXX)
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'stop_task_timer; rm -rf "$STAGE"' EXIT
   trap 'exit 1' HUP INT TERM
 
   if interrupted_first_install || [ ! -f /opt/xray/config.json ]; then
@@ -587,7 +632,7 @@ main() {
   XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-$XRAY_ARCH.zip"
   XY_URL='https://raw.githubusercontent.com/brian952700/xray-reality-installer/a76410f83b1dbe137dcdedad7a284d7cfb3814b0/xray-users.py'
   XY_SHA256='d30cfa98420e7ea38012e0f334ab62e431db211a98265e86437c3aee3e38e283'
-  run_quiet "下载 Xray $XRAY_VERSION" curl -fsSL --retry 2 --retry-max-time 120 --connect-timeout 10 --max-time 90 "$XRAY_URL" -o "$STAGE/xray.zip"
+  download_xray
   run_quiet '下载用户管理脚本' curl -fsSL --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 25 "$XY_URL" -o "$STAGE/xy"
   printf '%s  %s\n' "$XRAY_SHA256" "$STAGE/xray.zip" "$XY_SHA256" "$STAGE/xy" > "$STAGE/checksums"
   run_quiet '校验 SHA-256' sha256sum -c "$STAGE/checksums"
