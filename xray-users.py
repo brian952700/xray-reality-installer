@@ -176,6 +176,13 @@ def wait_for_listener(ports, timeout=12):
     raise ValueError(f"Xray 未在规定时间内监听 TCP {port_list}。")
 
 
+def restart_and_check(restart, port, progress):
+    progress("正在重启 Xray 服务并检查监听…")
+    command(*restart)
+    wait_for_listener([port])
+    progress("✓ Xray 服务已重启，监听端口已就绪。")
+
+
 def save(config, original, port, progress):
     manager = service_manager()
     if manager == "openrc":
@@ -204,9 +211,7 @@ def save(config, original, port, progress):
 
         try:
             os.replace(candidate, CONFIG)
-            progress("正在重启并检查 Xray 监听…")
-            command(*restart)
-            wait_for_listener([port])
+            restart_and_check(restart, port, progress)
         except SERVICE_ERRORS + (KeyboardInterrupt,) as original_error:
             if candidate.exists():
                 raise
@@ -241,6 +246,13 @@ def manage(action, name=None, progress=lambda message: None, expected_id=None,
                     if item.get("protocol") == "vless"]
         if len(inbounds) != 1:
             raise ValueError("配置必须恰好包含一个 VLESS 入站。")
+        if action == "restart":
+            port = inbounds[0]["port"]
+            command(str(BINARY), "run", "-test", "-c", str(CONFIG), timeout=15)
+            restart = (("rc-service", "xray", "restart") if service_manager() == "openrc"
+                       else ("systemctl", "restart", "xray"))
+            restart_and_check(restart, port, progress)
+            return
         clients = inbounds[0]["settings"]["clients"]
         if action == "snapshot":
             return config, sha256(original).hexdigest()
@@ -755,10 +767,15 @@ def menu():
     while True:
         try:
             print(color("\n── Xray 用户管理 ──", "36"))
-            print("\n  1. 查看所有用户\n  2. 新增用户\n  3. 给原有用户命名\n  4. 删除用户\n  5. 配置用户出口\n  6. 完整卸载 Xray\n  0. 退出\n")
-            choice = input("请选择 [0–6]：").strip()
+            print("\n  1. 查看所有用户\n  2. 新增用户\n  3. 给原有用户命名\n  4. 删除用户\n  5. 配置用户出口\n  6. 完整卸载 Xray")
+            print("  7. 重启 Xray 服务\n  0. 退出\n")
+            choice = input("请选择 [0–7]：").strip()
             if choice == "0":
                 return
+            if choice == "7":
+                manage("restart", progress=lambda message: print(color(message, "36"), flush=True))
+                print()
+                continue
             if choice == "6":
                 if uninstall():
                     return
@@ -770,7 +787,7 @@ def menu():
                 display_links(manage("list-links"))
                 continue
             if choice not in actions:
-                print(color("请输入 0–6。", "33"))
+                print(color("请输入 0–7。", "33"))
                 continue
 
             expected_id = None
@@ -820,7 +837,7 @@ def menu():
 
 def main():
     parser = argparse.ArgumentParser(description="管理 Xray VLESS 用户")
-    parser.add_argument("--version", action="version", version="xy 1.2.1")
+    parser.add_argument("--version", action="version", version="xy 1.2.2")
     parser.add_argument("action", nargs="?", choices=("list", "add", "remove", "name-existing"))
     parser.add_argument("name", nargs="?")
     args = parser.parse_args()
@@ -841,7 +858,7 @@ def main():
         if args.action == "list":
             display_links(manage("list-links"))
             return
-        result = manage(args.action, args.name)
+        result = manage(args.action, args.name, progress=lambda message: print(message, file=sys.stderr, flush=True))
         print(result)
         if args.action == "add":
             display_added_link(result.split("\t", 1)[1])
